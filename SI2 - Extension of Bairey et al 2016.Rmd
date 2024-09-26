@@ -1,0 +1,724 @@
+---
+title: "Supplementary Information 2: Critical strength of interactions (Repeat and Expansion of Bairey et al.)"
+author: "Chris Terry"
+date: "`r Sys.Date()`"
+output: 
+  html_document: 
+    toc: true
+editor_options: 
+  chunk_output_type: console
+---
+
+# Introduction 
+
+This script documents the analysis to first repeat the analysis of Bairey et al. 2016 (Bairey, E., Kelsic, E. & Kishony, R. High-order species interactions shape ecosystem diversity. Nat Commun 7, 12285 (2016). https://doi.org/10.1038/ncomms12285) and then extend it with structured HOIs. 
+
+
+```{r message=FALSE, warning=FALSE}
+#library(pracma)
+library(deSolve)
+sapply(paste0('Scripts/',list.files('Scripts/')), source)->tmp
+require(igraph)
+require(MASS)
+require(tidyverse)
+require(pracma)
+require(moments)
+require(rmutil)
+require(mvtnorm)
+require(mgcv)
+
+```
+
+
+# ODE Models 
+
+To minimise operations each combination of orders of interactions is made as a separate model, but all follow the same format.
+
+All models are LV rather than replicator equations, so technically match SI 5 of Bairey et al, not the main text figures. 
+
+```{R}
+PairDyn = function(t, state, parameters ){
+  if( any(is.na(state))|any(state<0.000001/N)){return(list(rep(0,N))) } ## if a sure gonner, stop calculating immediately.
+  x_i <-  - state## Self Reg 
+  Pairwise<-    A_mat%*%state## pairwise effects
+  return( list(state*(r+ x_i + Pairwise )))
+}
+ThreeDyn = function(t, state, parameters ){
+  
+  x_i <-  - state ## Self Reg 
+  ## Three way effects
+  XjXk = outer(state,state)
+  ThreeWay<- rep(NA, N) 
+  for( i in 1:N){
+    ThreeWay[i] <- sum(B_mat[i,,]*XjXk)
+  }
+  return(list(state*(r+ x_i +ThreeWay)))
+}
+FourDyn = function(t, state, parameters ){
+  
+  if( any(is.na(state))|any(state<0.000001/N)){return(list(rep(0,N))) }  
+  ## Self Reg 
+  x_i <-  - state
+  ## four way effects i,j,k,l
+  Fourway<- rep(NA, N) ## vector of effects on each i
+  for( i in 1:N){
+    XkXl = outer(state,state)
+    XjXkXl =  sweep(array(XkXl, dim = c(N,N,N) ),3,state,FUN="*")
+    Fourway[i] <- sum(C_mat[i,,,]*XjXkXl)
+  }
+  return( list(state*(r+ x_i  + Fourway)))
+}
+TwoAndThreeDyn = function(t, state, parameters ){
+  if( any(is.na(state))|any(state<0.000001/N)){return(list(rep(0,N))) } 
+  x_i <-  - state ## Self Reg
+  Pairwise<-    A_mat%*%state  ## Pairwise
+  ## Three way effects
+  XjXk = outer(state,state)
+  ThreeWay<- rep(NA, N) 
+  for( i in 1:N){
+    ThreeWay[i] <- sum(B_mat[i,,]*XjXk)
+  }
+  return(list(state*(r+ x_i + Pairwise+ ThreeWay)))
+}
+
+PairAndFourDyn = function(t, state, parameters ){
+  if( any(is.na(state))|any(state<0.000001/N)){return(list(rep(0,N))) } 
+  x_i <-  - state  ## Self Reg
+  Pairwise<-    A_mat%*%state ## Pairwise
+  ## four way effects i,j,k,l
+  Fourway<- rep(NA, N) ## vector of effects on each i
+  for( i in 1:N){
+    XkXl = outer(state,state)
+    XjXkXl =  sweep(array(XkXl, dim = c(N,N,N) ),3,state,FUN="*")
+    Fourway[i] <- sum(C_mat[i,,,]*XjXkXl)
+  }
+  return( list(state*(r+ x_i  +Pairwise+  Fourway)))
+}
+
+```
+
+# Process of finding critical alpha's
+
+For each number of species (N), calculate the critical strength of an interaction that leads to loss of feasibility. 
+
+Feasibility is defined as >10% of random draws having at least one extinction. Extinctions are defined as a species being below 0.0001/N at the end point. 
+
+For computational efficiency, integration is interrupted if a species falls below 0.000001/N, Convergence is tested by a comparison of t = 700 with t = 1000. If the entropy has stabilised the run is stopped, if not, it is run to 10000 time steps.   Plots are made to check up on whether this is enough. 
+
+Strengths are tested from high values and successively reduced on a logarithmic scale. After 10% of runs fail, the strength is reduced. 
+
+
+## Example Simplified loop
+
+This loop has additional comments and the  diagnostics and some error catchers removed for clarity. Others follow the same structure. 
+
+```{r eval = FALSE}
+N_timesteps = 10  ## number of timesteps to record from the ode. (by having fewer, the integrator can make bigger leaps)
+TimeStepsInt = seq( 1, 1000, length = N_timesteps)  ## time steps to use in first integration.
+
+N_reps = 50   # number of communities to build at each strength level
+Str_seq = rev(10^seq(from= -3, to = -1, by = 0.1 ))  # sequence of strengths of interaction to test (different for each) 
+N_Seq =  seq(5, 25, by = 5)          # sequence of species numbers to test. 
+
+N_df_alpha = data.frame(N =  N_Seq,  CritInt = NA) ## data.frame to save critical values in. 
+
+for(N_i  in 1:length(N_Seq)){ ## cycling through species numbers
+  N = N_df_alpha$N[N_i]
+  for ( alpha  in  Str_seq ){    ## cycling down through critical strengths
+    Feasible_vec = rep(NA, N_reps)  ## make vector to record feasibility 
+    for( rep in 1:N_reps){           ## cycling through replicates
+      if(sum(Feasible_vec==FALSE, na.rm=TRUE)> 0.1*N_reps){       ## If already know enough are not feasible at this strength, don't run more integration
+        Feasible_vec[rep]<-FALSE
+      }else{
+        set.seed(rep)  # setting the seed here means the distribution of interactions matches across strengths
+        r = 1/N    #Self effects 
+        A_mat = matrix(rnorm(N*N), nrow = N, ncol = N) *sqrt(alpha)  ## generate interaction matrices
+        Traj <-  ode(f = PairDyn, times = TimeStepsInt,             ## run ODE 
+                     y = rep(1/N, N),                                 # start values = 1/N
+                     method = 'ode45', parms = NULL)
+        Endpoints<- Traj[,-1][N_timesteps,] # save endpoint
+        SeventyPerc<- Traj[,-1][round(N_timesteps*0.7),] # save data from 70% of the way through time series
+        
+        if(any(is.na(Endpoints)) | any(Endpoints<=0) |any(SeventyPerc<=0)  ){  ## if any extinct, declare not feasible
+          Feasible_vec[rep]<- FALSE 
+        }else{
+          Ent1=sum( Endpoints*log(Endpoints)) ## Calc two values of entropy to detect if still getting movement
+          Ent2=sum( SeventyPerc*log(SeventyPerc))
+          if( log10(abs(Ent1-Ent2)) > -5){ ## if not converged by this point, run for longer
+            Traj <-  ode(f = PairDyn, times = seq(1000, 10000, length = N_timesteps),
+                         y = Endpoints, method = 'ode45', parms = NULL)
+            Endpoints<- Traj[,-1][N_timesteps,] ## save extended endpoints
+          }
+          Feasible_vec[rep]<- (all(Endpoints>0.0001/N  ) &   all(Endpoints< 100*N  ))  ## also fail if any species is very large
+          if(is.na(Feasible_vec[rep])){Feasible_vec[rep]<- FALSE }  ## error catching 
+        }
+      }
+    }
+    frac_feas = sum(Feasible_vec, na.rm=TRUE)/N_reps  # calculate fesiblity
+    if( frac_feas > 0.9){   # if feasibility >90% identified, 
+      N_df_alpha$CritInt[N_i] = alpha  ## then declare the current alpha the critical value 
+      break()           ## don't test even weaker strengths. 
+    }
+  }
+}
+
+```
+
+# Finding Critical Values
+
+### Consistent Values 
+
+```{r}
+N_timesteps = 10
+TimeStepsInt = seq( 1, 1000, length = N_timesteps)
+N_reps = 50
+N_Seq =  seq(10, 30, by = 5)
+
+PLOT = FALSE ## don't make diagnostic plots anymore
+
+```
+
+
+## Finding Critical alpha value for pairwise
+
+```{r  eval = FALSE}
+Str_seq = rev(10^seq(from= -3, to = -1, by = 0.05 ))
+N_df_alpha = data.frame(N =  N_Seq,  CritInt = NA)
+
+for(N_i  in 1:length(N_Seq)){
+  N = N_df_alpha$N[N_i]
+  print(paste('N=', N))
+  for ( alpha  in  Str_seq ){
+    print(paste('alpha=', log10(alpha)))
+    Feasible_vec = rep(NA, N_reps)
+    for( rep in 1:N_reps){
+      if(sum(Feasible_vec==FALSE, na.rm=TRUE)> 0.1*N_reps){       ## if already had more than 10% of total fails, don't bother running more replicates at this level
+        Feasible_vec[rep]<-FALSE
+        cat('E')
+      }else{
+        set.seed(rep)
+        r = 1/N    #Self effects 
+        A_mat = matrix(rnorm(N*N), nrow = N, ncol = N) *sqrt(alpha)
+        Traj <-  ode(f = PairDyn, times = TimeStepsInt,
+                     y = rep(1/N, N), method = 'ode45', parms = NULL)
+        Endpoints<- Traj[,-1][N_timesteps,] # save endpoint
+        SeventyPerc<- Traj[,-1][round(N_timesteps*0.7),] # save data from 70% of the way through time series
+        
+        if(any(is.na(Endpoints)) | any(Endpoints<=0) |any(SeventyPerc<=0)  ){
+          Feasible_vec[rep]<- FALSE 
+        }else{
+          ## Calc two values of entropy to detect if still getting movement
+          Ent1=sum( Endpoints*log(Endpoints))
+          Ent2=sum( SeventyPerc*log(SeventyPerc))
+          if( log10(abs(Ent1-Ent2)) > -5){ ## if not converged by this point, run for longer
+            cat('_X')
+            if(PLOT){ matplot(log10(Traj[,-1]), type = 'l'); title( paste('Running Extra Rep:', rep, Feasible_vec[rep]));Sys.sleep(0.1)}
+            Traj <-  ode(f = PairDyn, times = seq(1000, 10000, length = N_timesteps),
+                         y = Endpoints, method = 'ode45', parms = NULL)
+            Endpoints<- Traj[,-1][N_timesteps,] 
+          }
+          Feasible_vec[rep]<- (all(Endpoints>0.0001/N  ) &   all(Endpoints< 100*N  ))  
+          if(is.na(Feasible_vec[rep])){Feasible_vec[rep]<- FALSE }
+        }
+        cat(Feasible_vec[rep]*1)
+        if(PLOT){   matplot(log10(Traj[,-1]), type = 'l'); title( paste('Rep:', rep, Feasible_vec[rep]));Sys.sleep(0.1)}
+      }
+    }
+    
+    frac_feas = sum(Feasible_vec, na.rm=TRUE)/N_reps
+    print(frac_feas)
+    if( frac_feas > 0.9){ ## reversing 
+      N_df_alpha$CritInt[N_i] = alpha
+      break()
+    }
+  }
+}
+
+N_df_alpha$LogAlphaCrit = log10(N_df_alpha$CritInt)
+write_csv(N_df_alpha,   'Generated Data/CriticalValues/N_df_alpha.csv')
+plot(x=N_df_alpha$N, y = log10(N_df_alpha$CritInt))
+
+```
+
+## Finding Critical beta value for three-way
+
+```{r eval = FALSE}
+Str_seq = rev(10^seq(from= -1.5, to = 0, by = 0.05 ))
+N_df_beta = data.frame(N =  N_Seq, CritInt = NA)
+
+for(N_i  in 1:length(N_Seq)){
+  N = N_df_beta$N[N_i]
+  print(paste('N=', N))
+  for ( beta  in  Str_seq ){
+    print(paste('beta=', log10(beta)))
+    Feasible_vec = rep(NA, N_reps)
+    for( rep in 1:N_reps){
+      if(sum(Feasible_vec==FALSE, na.rm=TRUE)> 0.1*N_reps){       ## if already had more than 10% of total fails, don't bother running more replicates at this level
+        Feasible_vec[rep]<-FALSE
+        cat('E')
+      }else{
+        set.seed(rep)
+        r = 1/N    #Self effects 
+        B_mat = array(rnorm(N^3), dim = c(N,N,N))* sqrt(beta)## Threeway
+        Traj <-  ode(f = ThreeDyn, times = TimeStepsInt,
+                     y = rep(1/N, N), method = 'ode45', parms = NULL)
+        Endpoints<- Traj[,-1][N_timesteps,] # save endpoint
+        SeventyPerc<- Traj[,-1][round(N_timesteps*0.7),] # save data from 70% of the way through time series
+        
+        if(any(is.na(Endpoints)) | any(Endpoints<=0) |any(SeventyPerc<=0) ){
+          Feasible_vec[rep]<- FALSE 
+        }else{
+          ## Calc two values of entropy to detect if still getting movement
+          Ent1=sum( Endpoints*log(Endpoints))
+          Ent2=sum( SeventyPerc*log(SeventyPerc))
+          if( log10(abs(Ent1-Ent2)) > -5){ ## if not converged by this point, run for longer
+            cat('_X')
+            if(PLOT){ matplot(log10(Traj[,-1]), type = 'l'); title( paste('Running Extra Rep:', rep, Feasible_vec[rep]));Sys.sleep(0.1)}
+            Traj <-  ode(f = ThreeDyn, times = seq(1000, 10000, length = N_timesteps),
+                         y = Endpoints, method = 'ode45', parms = NULL)
+            Endpoints<- Traj[,-1][N_timesteps,] 
+          }
+          Feasible_vec[rep]<- (all(Endpoints>0.0001/N  ) &   all(Endpoints< 100*N  ))  
+          if(is.na(Feasible_vec[rep])){Feasible_vec[rep]<- FALSE }
+        }
+        cat(Feasible_vec[rep]*1)
+        if(PLOT){   matplot(log10(Traj[,-1]), type = 'l'); title( paste('Rep:', rep, Feasible_vec[rep]));Sys.sleep(0.1)}
+      }
+    }
+    
+    frac_feas = sum(Feasible_vec, na.rm=TRUE)/N_reps
+    print(frac_feas)
+    if( frac_feas > 0.9){ ## reversing 
+      N_df_beta$CritInt[N_i] = beta
+      break()
+    }
+  }
+}
+
+N_df_beta$LogBetaCrit = log10(N_df_beta$CritInt)
+
+write_csv(N_df_beta,  'Generated Data/CriticalValues/N_df_beta.csv')
+
+plot(x=N_df_beta$N, y = log10(N_df_beta$CritInt))
+
+```
+
+## Finding critical gamma value (Four way)  
+
+
+```{r eval = FALSE}
+Str_seq = rev(10^seq(from= -1.5, to = 0.6, by = 0.05 ))
+N_df_gamma = data.frame(N =  N_Seq,  CritInt = NA)
+
+for(N_i  in 1:length(N_Seq)){
+  N = N_df_gamma$N[N_i]
+  print(paste('N=', N))
+  for ( gamma  in  Str_seq ){
+    print(paste('gamma=', log10(gamma)))
+    Feasible_vec = rep(NA, N_reps)
+    for( rep in 1:N_reps){
+      if(sum(Feasible_vec==FALSE, na.rm=TRUE)> 0.1*N_reps){
+        ## if already had more than 10% of total fails, don't bother running more
+        Feasible_vec[rep]<-FALSE
+        cat('E')
+      }else{
+        
+        set.seed(rep)
+        #Self effects 
+        r = 1/N
+        ## Fourway effects
+        C_mat = array(rnorm(N^4), dim = c(N,N,N,N))* sqrt(gamma)
+        Traj <-  ode(f = FourDyn, times = TimeStepsInt,
+                     y = rep(1/N, N), method = 'ode45', parms = NULL)
+        
+        Endpoints<- Traj[,-1][N_timesteps,]
+        SeventyPerc<- Traj[,-1][round(N_timesteps*0.7),]
+        
+        if(any(is.na(Endpoints) | any(Endpoints<=0) |any(SeventyPerc<=0) ) ){
+          Feasible_vec[rep]<- FALSE 
+        }else{
+          ## Calc two values of entropy
+          Ent1=sum( Endpoints*log(Endpoints))
+          Ent2=sum( SeventyPerc*log(SeventyPerc))
+          
+          if( log10(abs(Ent1-Ent2)) > -5){ ## if not converged by this point, run for longer
+            cat('_X')
+             if(PLOT){  matplot(log10(Traj[,-1]), type = 'l'); title( paste('Running Extra Rep:', rep, Feasible_vec[rep]));Sys.sleep(0.1)}
+            Traj <-  ode(f = FourDyn, times = seq(1000, 10000, length = N_timesteps),
+                         y = Endpoints, method = 'ode45', parms = NULL)
+            Endpoints<- Traj[,-1][N_timesteps,] 
+          }
+          Feasible_vec[rep]<- (all(Endpoints>0.0001/N  ) &   all(Endpoints< 100*N  ))  
+          if(is.na(Feasible_vec[rep])){Feasible_vec[rep]<- FALSE }
+        }
+        cat(Feasible_vec[rep]*1)
+         if(PLOT){  matplot(log10(Traj[,-1]), type = 'l'); title( paste('Rep:', rep, Feasible_vec[rep]));Sys.sleep(0.1)}
+      }
+    }
+    
+    frac_feas = sum(Feasible_vec, na.rm=TRUE)/N_reps
+    print(frac_feas)
+    if( frac_feas > 0.9){ ## reversing 
+      N_df_gamma$CritInt[N_i] = gamma
+      break()
+    }
+  }
+}
+
+plot(x=N_df_gamma$N, y = log10(N_df_gamma$CritInt))
+N_df_gamma$LogGammaCrit = log10(N_df_gamma$CritInt)
+write_csv(N_df_gamma,  'Generated Data/CriticalValues/N_df_gamma.csv')
+```
+
+# Repeating Bairey with constant trophic underlay and random 3 and 4 way:
+
+## Three way on top
+
+`A` mat added at a level that allows feasibility at that population size. 
+
+```{r}
+Build_A <- function( rep, N){return(BuildWeb(ID =rep, N,  connectance = 0.5,
+                                             mux = -1,  muy = 1,
+                                             sigmax = 1,  sigmay = 1, 
+                                             rhoxy = -2/3))}
+```
+
+## Random 3way
+
+```{R eval = FALSE}
+Str_seq = rev(10^seq(from= -2, to = 0, by = 0.05))
+alpha = 0.001 ## Strength of underlying trophic network
+N_df_beta_RAND_ONTROPHIC = data.frame(N =  N_Seq, CritInt = NA)
+
+
+for(N_i  in 1:length(N_Seq)){
+  N = N_df_beta_RAND_ONTROPHIC$N[N_i]
+  print(paste('N=', N))
+  for ( beta  in  Str_seq ){
+    print(paste('beta=', log10(beta)))
+    Feasible_vec = rep(NA, N_reps)
+    for( rep in 1:N_reps){
+      if(sum(Feasible_vec==FALSE, na.rm=TRUE)> 0.1*N_reps){       ## if already had more than 10% of total fails, don't bother running more replicates at this level
+        Feasible_vec[rep]<-FALSE
+        cat('E')
+      }else{
+        set.seed(rep)
+        r = 1/N    #Self effects 
+        ### defining underlying tropic web#####################
+        A_mat_unscaled = Build_A(rep, N)
+        A_mat <- A_mat_unscaled/ mean(abs(A_mat_unscaled)) *sqrt(alpha) / sqrt(N)
+        #        image(A_mat, main = 'Trophic network')
+        ################################
+        set.seed(rep)
+        
+        B_mat = array(rnorm(N^3), dim = c(N,N,N))* sqrt(beta)## Threeway
+        Traj <-  ode(f = TwoAndThreeDyn, times = TimeStepsInt,
+                     y = rep(1/N, N), method = 'ode45', parms = NULL)
+        Endpoints<- Traj[,-1][N_timesteps,] # save endpoint
+        SeventyPerc<- Traj[,-1][round(N_timesteps*0.7),] # save data from 70% of the way through time series
+        
+        if(any(is.na(Endpoints)) | any(Endpoints<=0) |any(SeventyPerc<=0) ){
+          Feasible_vec[rep]<- FALSE 
+        }else{
+          ## Calc two values of entropy to detect if still getting movement
+          Ent1=sum( Endpoints*log(Endpoints))
+          Ent2=sum( SeventyPerc*log(SeventyPerc))
+          if( log10(abs(Ent1-Ent2)) > -5){ ## if not converged by this point, run for longer
+            cat('_X')
+            if(PLOT){ matplot(log10(Traj[,-1]), type = 'l'); title( paste('Running Extra Rep:', rep, Feasible_vec[rep]));Sys.sleep(0.1)}
+            Traj <-  ode(f = TwoAndThreeDyn, times = seq(1000, 10000, length = N_timesteps),
+                         y = Endpoints, method = 'ode45', parms = NULL)
+            Endpoints<- Traj[,-1][N_timesteps,] 
+          }
+          Feasible_vec[rep]<- (all(Endpoints>0.0001/N  ) &   all(Endpoints< 100*N  ))  
+          if(is.na(Feasible_vec[rep])){Feasible_vec[rep]<- FALSE }
+        }
+        cat(Feasible_vec[rep]*1)
+        if(PLOT){   matplot(log10(Traj[,-1]), type = 'l'); title( paste('Rep:', rep, Feasible_vec[rep]));Sys.sleep(0.1)}
+      }
+    }
+    
+    frac_feas = sum(Feasible_vec, na.rm=TRUE)/N_reps
+    print(frac_feas)
+    if( frac_feas > 0.9){ ## reversing 
+      N_df_beta_RAND_ONTROPHIC$CritInt[N_i] = beta
+      break()
+    }
+  }
+}
+
+N_df_beta_RAND_ONTROPHIC$LogBetaCrit = log10(N_df_beta_RAND_ONTROPHIC$CritInt) ## Critical value stays constant at ~1.2 with random HOIs. 
+write_csv(N_df_beta_RAND_ONTROPHIC, 
+          'Generated Data/CriticalValues/N_df_beta_RAND_ONTROPHIC.csv')
+```
+
+## Structured 3way
+
+```{R eval = FALSE}
+Str_seq  =rev(10^seq(from= -3, to = -1, by = 0.05  ))
+
+alpha = 0.001
+TIM_Dens =0.1        ## How many interactions does each species modify? [[proportion of cube non-zero]]
+N_df_beta_STRUC_ONTROPHIC = data.frame(N =  N_Seq,  CritInt = NA)
+
+for(N_i  in 1:length(N_Seq)){
+  N = N_df_beta_STRUC_ONTROPHIC$N[N_i]
+  print(paste('N=', N))
+  for ( beta  in  Str_seq ){
+    print(paste('beta=', log10(beta)))
+    Feasible_vec = rep(NA, N_reps)
+    for( rep in 1:N_reps){
+      if(sum(Feasible_vec==FALSE, na.rm=TRUE)> 0.1*N_reps){       ## if already had more than 10% of total fails, don't bother running more replicates at this level
+        Feasible_vec[rep]<-FALSE
+        cat('E')
+      }else{
+        set.seed(rep)
+        r = 1/N    #Self effects 
+        ### defining underlying tropic web#####################
+        A_mat_unscaled = Build_A(rep, N)
+        A_mat <- A_mat_unscaled/ mean(abs(A_mat_unscaled)) *sqrt(alpha) / sqrt(N)
+        #        image(A_mat, main = 'Trophic network')
+        ################################
+        set.seed(rep)
+        ### Build structured three way
+        B_mat_unscaled <- Build_Barray_Switching(A_mat, TIM_Dens = TIM_Dens*N*N)  ## N^2 here maintains connectance of HOI cube at approximately TIM_dens 
+        B_mat_scaled_var1 = B_mat_unscaled / sd( B_mat_unscaled) 
+        B_mat = B_mat_scaled_var1 * sqrt(beta)
+        #  print(paste0('TrophicConn=',mean(A_mat!=0),'TIM_CONN=', mean(B_mat!=0)))
+        Traj <-  ode(f = TwoAndThreeDyn, times = TimeStepsInt,
+                     y = rep(1/N, N), method = 'ode45', parms = NULL)
+        Endpoints<- Traj[,-1][N_timesteps,] # save endpoint
+        SeventyPerc<- Traj[,-1][round(N_timesteps*0.7),] # save data from 70% of the way through time series
+        
+        if(any(is.na(Endpoints)) | any(Endpoints<=0) |any(SeventyPerc<=0) ){
+          Feasible_vec[rep]<- FALSE 
+        }else{
+          ## Calc two values of entropy to detect if still getting movement
+          Ent1=sum( Endpoints*log(Endpoints))
+          Ent2=sum( SeventyPerc*log(SeventyPerc))
+          if( log10(abs(Ent1-Ent2)) > -5){ ## if not converged by this point, run for longer
+            cat('_X')
+            if(PLOT){ matplot(log10(Traj[,-1]), type = 'l'); title( paste('Running Extra Rep:', rep, Feasible_vec[rep]));Sys.sleep(0.1)}
+            Traj <-  ode(f = TwoAndThreeDyn, times = seq(1000, 10000, length = N_timesteps),
+                         y = Endpoints, method = 'ode45', parms = NULL)
+            Endpoints<- Traj[,-1][N_timesteps,] 
+          }
+          Feasible_vec[rep]<- (all(Endpoints>0.0001/N  ) &   all(Endpoints< 100*N  ))  
+          if(is.na(Feasible_vec[rep])){Feasible_vec[rep]<- FALSE }
+        }
+        cat(Feasible_vec[rep]*1)
+        if(PLOT){   matplot(log10(Traj[,-1]), type = 'l'); title( paste('Rep:', rep, Feasible_vec[rep]));Sys.sleep(0.1)}
+      }
+    }
+    
+    frac_feas = sum(Feasible_vec, na.rm=TRUE)/N_reps
+    print(frac_feas)
+    if( frac_feas > 0.9){ ## reversing 
+      N_df_beta_STRUC_ONTROPHIC$CritInt[N_i] = beta
+      break()
+    }
+  }
+}
+
+N_df_beta_STRUC_ONTROPHIC$LogBetaCrit = log10(N_df_beta_STRUC_ONTROPHIC$CritInt) 
+write_csv(N_df_beta_STRUC_ONTROPHIC, 
+          'Generated Data/CriticalValues/N_df_beta_STRUC_ONTROPHIC.csv')
+## With structure, get more destabilising impact of HOIs
+```
+
+## 4 way 
+
+### Random 4way overlaid over trophic
+
+```{r eval = FALSE}
+alpha = 0.001
+Str_seq =  rev(10^seq(from= -2, to = 1, by = 0.05  ))
+N_df_gamma_RANDOM_ONTROPHIC = data.frame(N =  N_Seq, CritInt = NA)
+
+for(N_i  in 1:length(N_Seq)){
+  N = N_df_gamma_RANDOM_ONTROPHIC$N[N_i]
+  print(paste('N=', N))
+  #Self effects 
+  r = 1/N
+  for ( gamma  in  Str_seq ){
+    print(paste('gamma=', log10(gamma)))
+    Feasible_vec = rep(NA, N_reps)
+    for( rep in 1:N_reps){
+      if(sum(Feasible_vec==FALSE, na.rm=TRUE)> 0.1*N_reps){        ## if already had more than 10% of total fails, don't bother running more
+        Feasible_vec[rep]<-FALSE;cat('E')
+      }else{
+        set.seed(rep)
+        # Trophic Interactions
+        A_mat_unscaled = Build_A(rep, N)
+        A_mat <- A_mat_unscaled/ mean(abs(A_mat_unscaled)) *sqrt(alpha) / sqrt(N)
+        ################################
+        set.seed(rep)
+        
+        ## Random Fourway effects
+        C_mat = array(rnorm(N^4), dim = c(N,N,N,N))* sqrt(gamma)
+        Traj <-  ode(f = PairAndFourDyn, times = TimeStepsInt,
+                     y = rep(1/N, N), method = 'ode45', parms = NULL)
+        
+        Endpoints<- Traj[,-1][N_timesteps,]
+        SeventyPerc<- Traj[,-1][round(N_timesteps*0.7),]
+        
+        if(any(is.na(Endpoints) | any(Endpoints<=0) |any(SeventyPerc<=0) ) ){
+          Feasible_vec[rep]<- FALSE 
+        }else{
+          ## Calc two values of entropy
+          Ent1=sum( Endpoints*log(Endpoints))
+          Ent2=sum( SeventyPerc*log(SeventyPerc))
+          
+          if( log10(abs(Ent1-Ent2)) > -5){ ## if not converged by this point, run for longer
+            cat('_X')
+            if(PLOT){    matplot(log10(Traj[,-1]), type = 'l'); title( paste('Running Extra Rep:', rep, Feasible_vec[rep]));Sys.sleep(0.1)}
+            Traj <-  ode(f = PairAndFourDyn, times = seq(1000, 10000, length = N_timesteps),
+                         y = Endpoints, method = 'ode45', parms = NULL)
+            Endpoints<- Traj[,-1][N_timesteps,] 
+          }
+          Feasible_vec[rep]<- (all(Endpoints>0.0001/N  ) &   all(Endpoints< 100*N  ))  
+          if(is.na(Feasible_vec[rep])){Feasible_vec[rep]<- FALSE }
+        }
+        cat(Feasible_vec[rep]*1)
+       if(PLOT){     matplot(log10(Traj[,-1]), type = 'l'); title( paste('Rep:', rep, Feasible_vec[rep]));Sys.sleep(0.1)}
+      }
+    }
+    
+    frac_feas = sum(Feasible_vec, na.rm=TRUE)/N_reps
+    print(frac_feas)
+    if( frac_feas > 0.9){ ## reversing 
+      N_df_gamma_RANDOM_ONTROPHIC$CritInt[N_i] = gamma
+      break()
+    }
+  }
+}
+
+N_df_gamma_RANDOM_ONTROPHIC$LogGammaCrit = log10(N_df_gamma_RANDOM_ONTROPHIC$CritInt) 
+
+write_csv(N_df_gamma_RANDOM_ONTROPHIC, 
+          'Generated Data/CriticalValues/N_df_gamma_RANDOM_ONTROPHIC.csv')
+
+```
+
+### Structured 4way overlaid over trophic
+
+Not really any expectations of 4-way, but assume of [i,j,k,l] array, where i and j are prey and predator, k is a modifier, l is double modifier. 
+
+Define [i,j,k, ] as per 3-way structure, then define l axis randomly 
+
+```{r eval = FALSE}
+alpha = 0.001
+Str_seq =   rev(10^seq(from= -2, to = 0.5, by = 0.05  ))
+N_df_gamma_STRUCT_OnTROPHIC = data.frame(N =  N_Seq, CritInt = NA)
+
+for(N_i  in 1:length(N_Seq)){
+  N = N_df_gamma_STRUCT_OnTROPHIC$N[N_i]
+  print(paste('N=', N))
+  #Self effects 
+  r = 1/N
+  for ( gamma  in  Str_seq ){
+    print(paste('gamma=', log10(gamma)))
+    Feasible_vec = rep(NA, N_reps)
+    for( rep in 1:N_reps){
+      if(sum(Feasible_vec==FALSE, na.rm=TRUE)> 0.1*N_reps){        ## if already had more than 10% of total fails, don't bother running more
+        Feasible_vec[rep]<-FALSE;cat('E')
+      }else{
+        set.seed(rep)
+        # Trophic Interactions
+        A_mat_unscaled = Build_A(rep, N)
+        A_mat <- A_mat_unscaled/ mean(abs(A_mat_unscaled)) *sqrt(alpha) / sqrt(N)
+        ################################
+        set.seed(rep)
+        
+        ## Random Fourway effects
+        ## Find potential three way effects based on trophic network
+        Threeway_array_binary <- Build_Barray_Switching(A_mat, TIM_Dens = TIM_Dens*N*N)  ## N^2 here maintains connectance of HOI cube at approximately TIM_dens 
+        C_arr_binary <- array(NA, dim = c(N,N,N,N))
+        for( l in 1:N){
+          C_arr_binary[,,,l] <- Threeway_array_binary * rbinom(n=N^3, size =1,prob = 0.1) ## 10% of each TIM being modified
+        }
+        C_mat = C_arr_binary/ sd(C_arr_binary) * sqrt(gamma)
+        
+
+        Traj <-  ode(f = PairAndFourDyn, times = TimeStepsInt,
+                     y = rep(1/N, N), method = 'ode45', parms = NULL)
+        
+        Endpoints<- Traj[,-1][N_timesteps,]
+        SeventyPerc<- Traj[,-1][round(N_timesteps*0.7),]
+        
+        if(any(is.na(Endpoints) | any(Endpoints<=0) |any(SeventyPerc<=0) ) ){
+          Feasible_vec[rep]<- FALSE 
+        }else{
+          ## Calc two values of entropy
+          Ent1=sum( Endpoints*log(Endpoints))
+          Ent2=sum( SeventyPerc*log(SeventyPerc))
+          
+          if( log10(abs(Ent1-Ent2)) > -5){ ## if not converged by this point, run for longer
+            cat('_X')
+           if(PLOT){     matplot(log10(Traj[,-1]), type = 'l'); title( paste('Running Extra Rep:', rep, Feasible_vec[rep]));Sys.sleep(0.1)}
+            Traj <-  ode(f = PairAndFourDyn, times = seq(1000, 10000, length = N_timesteps),
+                         y = Endpoints, method = 'ode45', parms = NULL)
+            Endpoints<- Traj[,-1][N_timesteps,] 
+          }
+          Feasible_vec[rep]<- (all(Endpoints>0.0001/N  ) &   all(Endpoints< 100*N  ))  
+          if(is.na(Feasible_vec[rep])){Feasible_vec[rep]<- FALSE }
+        }
+        cat(Feasible_vec[rep]*1)
+      if(PLOT){matplot(log10(Traj[,-1]), type = 'l'); title( paste('Rep:', rep, Feasible_vec[rep]));Sys.sleep(0.1)}
+      }
+    }
+    
+    frac_feas = sum(Feasible_vec, na.rm=TRUE)/N_reps
+    print(frac_feas)
+    if( frac_feas > 0.9){ ## reversing 
+      N_df_gamma_STRUCT_OnTROPHIC$CritInt[N_i] = gamma
+      break()
+    }
+  }
+}
+
+N_df_gamma_STRUCT_OnTROPHIC$LogGammaCrit = log10(N_df_gamma_STRUCT_OnTROPHIC$CritInt) 
+
+write_csv(N_df_gamma_STRUCT_OnTROPHIC, 
+          'Generated Data/CriticalValues/N_df_gamma_STRUCT_OnTROPHIC.csv')
+
+plot(x=N_df_gamma_STRUCT_OnTROPHIC$N, y = N_df_gamma_STRUCT_OnTROPHIC$LogGammaCrit)
+```
+
+# Plotting all 
+
+```{r message=FALSE, warning=FALSE}
+fp <- 'Generated Data/CriticalValues/N_df_'
+
+bind_rows(
+  read_csv(paste0(fp,'alpha.csv')) %>% mutate(Exp='a) Random HOIs', Order='Two-way'),
+  read_csv(paste0(fp,'beta.csv')) %>% mutate(Exp='a) Random HOIs', Order='Three-way'),
+  read_csv(paste0(fp,'gamma.csv')) %>% mutate(Exp='a) Random HOIs', Order='Four-way'),
+  read_csv(paste0(fp,'beta_RAND_ONTROPHIC.csv')) %>% mutate(Exp='b) Trophic Structure and Random HOIs', Order='Three-way'),
+  read_csv(paste0(fp,'gamma_RANDOM_ONTROPHIC.csv')) %>% mutate(Exp='b) Trophic Structure and Random HOIs', Order='Four-way'),
+  read_csv(paste0(fp,'beta_STRUC_ONTROPHIC.csv')) %>% mutate(Exp='c) Trophic Structure and Structured HOIs', Order='Three-way'),
+  read_csv(paste0(fp,'gamma_STRUCT_OnTROPHIC.csv')) %>% mutate(Exp='c) Trophic Structure and Structured HOIs', Order='Four-way')
+) -> All_Criticals
+
+All_Criticals %>%
+  ggplot(aes( x = N, y =  CritInt, col=Order))+
+    geom_smooth(method = 'lm', se = FALSE, alpha= 0.5)+
+geom_point( )+
+  scale_y_log10()+
+  scale_color_viridis_d(name = 'Order of\ninteractions')+
+  theme_bw()+
+  facet_wrap(~ Exp)+
+  ylab('Critical Strength\nof Interactions')+
+  xlab('Number of species, N')
+
+
+```
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
+
+
+
